@@ -39,8 +39,12 @@ echo -e "${BLUE}========================================${NC}"
 echo ""
 
 # Prompt for domain
-echo -e "${YELLOW}Enter your Cloudflare domain (e.g., ir.spoon.rip):${NC}"
+echo -e "${YELLOW}Enter your Cloudflare domain (e.g., example.com):${NC}"
 read -r wanip
+if [ -z "$wanip" ]; then
+    echo -e "${RED}Domain cannot be empty${NC}"
+    exit 1
+fi
 if ! [[ $wanip =~ ^[a-zA-Z0-9]+([a-zA-Z0-9.-]*[a-zA-Z0-9]+)?$ ]]; then
     echo -e "${RED}Invalid domain format${NC}"
     exit 1
@@ -93,7 +97,7 @@ echo -e "${GREEN}Detected OS: ${OS} ${VER}${NC}"
 
 # Setup prereqs
 PREREQ="curl wget unzip tar git qrencode python$PYTHON_MAJOR_MINOR-venv jq"
-PREREQDEB="dnsutils"
+PREREQDEB="dnsutils lsb-release"
 
 echo -e "${GREEN}Installing prerequisites...${NC}"
 if [ "${ID}" = "debian" ] || [ "$OS" = "Ubuntu" ] || [ "$OS" = "Debian" ] || [ "${UPSTREAM_ID}" = "debian" ] || [ "${UPSTREAM_ID}" = "ubuntu" ]; then
@@ -117,11 +121,36 @@ if [ "${ID}" = "debian" ] || [ "$OS" = "Ubuntu" ] || [ "$OS" = "Debian" ] || [ "
     mkdir -p --mode=0755 /usr/share/keyrings
     curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg | tee /usr/share/keyrings/cloudflare-main.gpg >/dev/null
     
-    # Add cloudflare repo
-    echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" | tee /etc/apt/sources.list.d/cloudflared.list
+    # Detect distribution codename
+    if command -v lsb_release >/dev/null 2>&1; then
+        DISTRO_CODENAME=$(lsb_release -cs)
+    elif [ -f /etc/os-release ]; then
+        . /etc/os-release
+        DISTRO_CODENAME=$VERSION_CODENAME
+    else
+        DISTRO_CODENAME="bookworm"  # Default for Debian 12
+    fi
     
-    apt-get update
-    apt-get install -y cloudflared
+    # Add cloudflare repo
+    echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared ${DISTRO_CODENAME} main" | tee /etc/apt/sources.list.d/cloudflared.list
+    
+    apt-get update -qq 2>/dev/null || {
+        echo -e "${YELLOW}APT repo method failed, using direct download...${NC}"
+        rm -f /etc/apt/sources.list.d/cloudflared.list
+        if [ "${ARCH}" = "x86_64" ]; then
+            wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/local/bin/cloudflared
+            chmod +x /usr/local/bin/cloudflared
+        elif [ "${ARCH}" = "aarch64" ]; then
+            wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64 -O /usr/local/bin/cloudflared
+            chmod +x /usr/local/bin/cloudflared
+        elif [ "${ARCH}" = "armv7l" ]; then
+            wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm -O /usr/local/bin/cloudflared
+            chmod +x /usr/local/bin/cloudflared
+        fi
+    }
+    
+    # Try to install from repo if available, otherwise skip (already installed from direct download)
+    apt-get install -y cloudflared 2>/dev/null || echo -e "${GREEN}Cloudflared installed from direct download${NC}"
 else
     # Generic installation for other distros
     if [ "${ARCH}" = "x86_64" ]; then
@@ -133,6 +162,14 @@ else
     fi
     chmod +x /usr/local/bin/cloudflared
 fi
+
+# Verify cloudflared is installed
+if ! command -v cloudflared >/dev/null 2>&1; then
+    echo -e "${RED}Failed to install cloudflared${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}Cloudflared version: $(cloudflared --version | head -n1)${NC}"
 
 # Make folder /var/lib/rustdesk-server/
 echo -e "${GREEN}Creating RustDesk directories...${NC}"
@@ -244,9 +281,33 @@ echo -e "${GREEN}RustDesk Key: ${key}${NC}"
 
 # Clone API server
 echo -e "${GREEN}Cloning InfiniteRemote API Server...${NC}"
-cd /opt
-git clone -q https://github.com/infiniteremote/rustdesk-api-server.git
+cd /opt || exit 1
+
+# Remove old directory if exists
+if [ -d "/opt/rustdesk-api-server" ]; then
+    echo -e "${YELLOW}Removing existing API server directory...${NC}"
+    rm -rf /opt/rustdesk-api-server
+fi
+
+# Clone with timeout and progress
+if ! timeout 300 git clone --progress https://github.com/infiniteremote/rustdesk-api-server.git 2>&1 | while read -r line; do echo "$line"; done; then
+    echo -e "${RED}Failed to clone API server repository${NC}"
+    echo -e "${YELLOW}Trying alternative method...${NC}"
+    
+    # Try without progress output
+    if ! git clone https://github.com/infiniteremote/rustdesk-api-server.git; then
+        echo -e "${RED}Failed to clone repository. Please check your internet connection.${NC}"
+        exit 1
+    fi
+fi
+
+if [ ! -d "/opt/rustdesk-api-server" ]; then
+    echo -e "${RED}API server directory not created. Clone failed.${NC}"
+    exit 1
+fi
+
 chown -R ${usern}:${usern} /opt/rustdesk-api-server/
+echo -e "${GREEN}API server cloned successfully${NC}"
 
 # Generate secrets
 SECRET_KEY=$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 80 | head -n 1)
@@ -266,19 +327,62 @@ chown -R ${usern}:${usern} /var/log/rustdesk-server-api/
 
 # Setup Python environment
 echo -e "${GREEN}Setting up Python environment...${NC}"
-cd /opt/rustdesk-api-server/api
-python3 -m venv env
-source /opt/rustdesk-api-server/api/env/bin/activate
-pip install -q --no-cache-dir --upgrade pip
-pip install -q --no-cache-dir setuptools wheel
-pip install -q --no-cache-dir -r /opt/rustdesk-api-server/requirements.txt
+cd /opt/rustdesk-api-server/api || exit 1
 
-cd /opt/rustdesk-api-server/
-python manage.py makemigrations
-python manage.py migrate
-echo -e "${YELLOW}Please set your admin username and password for the Web UI${NC}"
-python manage.py securecreatesuperuser
+python3 -m venv env || {
+    echo -e "${RED}Failed to create Python virtual environment${NC}"
+    exit 1
+}
+
+source /opt/rustdesk-api-server/api/env/bin/activate || {
+    echo -e "${RED}Failed to activate virtual environment${NC}"
+    exit 1
+}
+
+echo -e "${YELLOW}Installing Python packages (this may take a few minutes)...${NC}"
+pip install -q --no-cache-dir --upgrade pip || echo -e "${YELLOW}Pip upgrade warning (non-critical)${NC}"
+pip install -q --no-cache-dir setuptools wheel || {
+    echo -e "${RED}Failed to install setuptools/wheel${NC}"
+    deactivate
+    exit 1
+}
+
+if ! pip install -q --no-cache-dir -r /opt/rustdesk-api-server/requirements.txt; then
+    echo -e "${RED}Failed to install Python requirements${NC}"
+    deactivate
+    exit 1
+fi
+echo -e "${GREEN}Python packages installed successfully${NC}"
+
+cd /opt/rustdesk-api-server/ || exit 1
+
+echo -e "${GREEN}Running database migrations...${NC}"
+python manage.py makemigrations || {
+    echo -e "${RED}Failed to create migrations${NC}"
+    deactivate
+    exit 1
+}
+
+python manage.py migrate || {
+    echo -e "${RED}Failed to run migrations${NC}"
+    deactivate
+    exit 1
+}
+
+echo ""
+echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo -e "${YELLOW}  Create Admin Account for Web Interface  ${NC}"
+echo -e "${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
+echo ""
+
+if ! python manage.py securecreatesuperuser; then
+    echo -e "${RED}Failed to create admin user${NC}"
+    deactivate
+    exit 1
+fi
+
 deactivate
+echo -e "${GREEN}Django setup completed${NC}"
 
 # Create API config (bind to localhost since Cloudflare will proxy)
 cat > /opt/rustdesk-api-server/api/api_config.py <<EOF
@@ -330,22 +434,45 @@ mkdir -p /var/log/cloudflared
 chown -R ${usern}:${usern} /var/log/cloudflared
 
 # Authenticate cloudflared with the API token
-echo "$CF_API_TOKEN" | cloudflared tunnel login --api-token
+echo -e "${YELLOW}Authenticating with Cloudflare...${NC}"
+if ! echo "$CF_API_TOKEN" | cloudflared tunnel login --api-token 2>&1 | tee /tmp/cf-auth.log; then
+    echo -e "${RED}Failed to authenticate with Cloudflare${NC}"
+    echo -e "${RED}Please check your API token and permissions${NC}"
+    cat /tmp/cf-auth.log
+    exit 1
+fi
+echo -e "${GREEN}Successfully authenticated with Cloudflare${NC}"
 
 # Create a tunnel
 TUNNEL_NAME="rustdesk-${wanip//./-}"
 echo -e "${YELLOW}Creating tunnel: ${TUNNEL_NAME}${NC}"
-TUNNEL_ID=$(cloudflared tunnel create ${TUNNEL_NAME} 2>&1 | grep -oP 'Created tunnel .* with id \K[a-f0-9-]+')
+
+# Try to create tunnel and capture output
+TUNNEL_OUTPUT=$(cloudflared tunnel create ${TUNNEL_NAME} 2>&1)
+TUNNEL_ID=$(echo "$TUNNEL_OUTPUT" | grep -oP 'Created tunnel .* with id \K[a-f0-9-]+' | head -n1)
 
 if [ -z "$TUNNEL_ID" ]; then
-    echo -e "${RED}Failed to create tunnel. Checking if tunnel already exists...${NC}"
-    TUNNEL_ID=$(cloudflared tunnel list | grep ${TUNNEL_NAME} | awk '{print $1}')
+    echo -e "${YELLOW}Tunnel creation returned unexpected output, checking for existing tunnel...${NC}"
     
-    if [ -z "$TUNNEL_ID" ]; then
-        echo -e "${RED}Could not create or find tunnel${NC}"
+    # Check if tunnel already exists
+    EXISTING_TUNNEL=$(cloudflared tunnel list 2>&1 | grep "${TUNNEL_NAME}" | head -n1)
+    if [ -n "$EXISTING_TUNNEL" ]; then
+        TUNNEL_ID=$(echo "$EXISTING_TUNNEL" | awk '{print $1}')
+        echo -e "${GREEN}Using existing tunnel: ${TUNNEL_ID}${NC}"
+    else
+        echo -e "${RED}Failed to create or find tunnel${NC}"
+        echo -e "${RED}Cloudflared output:${NC}"
+        echo "$TUNNEL_OUTPUT"
         exit 1
     fi
-    echo -e "${GREEN}Using existing tunnel: ${TUNNEL_ID}${NC}"
+else
+    echo -e "${GREEN}Created new tunnel: ${TUNNEL_ID}${NC}"
+fi
+
+# Verify tunnel ID is valid UUID format
+if ! [[ "$TUNNEL_ID" =~ ^[a-f0-9-]{36}$ ]]; then
+    echo -e "${RED}Invalid tunnel ID format: ${TUNNEL_ID}${NC}"
+    exit 1
 fi
 
 # Create tunnel configuration
@@ -387,15 +514,41 @@ EOF
 
 # Create DNS records for the tunnel
 echo -e "${GREEN}Creating DNS records...${NC}"
-cloudflared tunnel route dns ${TUNNEL_ID} ${wanip}
+if ! cloudflared tunnel route dns ${TUNNEL_ID} ${wanip} 2>&1 | tee /tmp/cf-dns.log; then
+    # Check if it already exists
+    if grep -q "already exists" /tmp/cf-dns.log; then
+        echo -e "${GREEN}DNS record already exists${NC}"
+    else
+        echo -e "${YELLOW}Warning: DNS record creation may have failed${NC}"
+        echo -e "${YELLOW}You may need to create the DNS record manually in Cloudflare dashboard${NC}"
+        cat /tmp/cf-dns.log
+    fi
+else
+    echo -e "${GREEN}DNS records created successfully${NC}"
+fi
 
 # Install and start the tunnel service
 echo -e "${GREEN}Installing Cloudflare Tunnel service...${NC}"
-cloudflared service install
+if ! cloudflared service install 2>&1 | tee /tmp/cf-service.log; then
+    echo -e "${YELLOW}Service installation warning (may already be installed)${NC}"
+    cat /tmp/cf-service.log
+fi
 
 # Start the tunnel
-systemctl start cloudflared
-systemctl enable cloudflared
+echo -e "${GREEN}Starting Cloudflare Tunnel...${NC}"
+systemctl enable cloudflared 2>/dev/null || true
+systemctl restart cloudflared
+
+# Wait a moment for service to start
+sleep 3
+
+# Check if service is running
+if systemctl is-active --quiet cloudflared; then
+    echo -e "${GREEN}Cloudflare Tunnel is running${NC}"
+else
+    echo -e "${YELLOW}Warning: Cloudflare Tunnel service may not be running${NC}"
+    echo -e "${YELLOW}Check status with: systemctl status cloudflared${NC}"
+fi
 
 # Setup installers
 echo -e "${GREEN}Configuring client installers...${NC}"
@@ -405,20 +558,32 @@ string64rev=$(echo -n "$string64" | rev)
 
 # Download Windows client
 RDCLATEST=$(curl https://api.github.com/repos/rustdesk/rustdesk/releases/latest -s | grep "tag_name" | awk '{print substr($2, 2, length($2)-3)}')
-wget -q -O /opt/rustdesk-api-server/static/configs/rustdesk-licensed-${string64rev}.exe \
-    https://github.com/rustdesk/rustdesk/releases/download/${RDCLATEST}/rustdesk-${RDCLATEST}-x86_64.exe
+echo -e "${YELLOW}Downloading RustDesk client ${RDCLATEST}...${NC}"
+
+if ! wget -q -O /opt/rustdesk-api-server/static/configs/rustdesk-licensed-${string64rev}.exe \
+    https://github.com/rustdesk/rustdesk/releases/download/${RDCLATEST}/rustdesk-${RDCLATEST}-x86_64.exe; then
+    echo -e "${YELLOW}Warning: Failed to download Windows client installer${NC}"
+    echo -e "${YELLOW}You can download it manually later${NC}"
+fi
+
+if [ -f "/opt/rustdesk-api-server/static/configs/rustdesk-licensed-${string64rev}.exe" ]; then
+    echo -e "${GREEN}Windows installer downloaded successfully${NC}"
+fi
 
 # Update installer templates
-sed -i "s|secure-string|${string64rev}|g" /opt/rustdesk-api-server/api/templates/installers.html
-sed -i "s|UniqueKey|${key}|g" /opt/rustdesk-api-server/api/templates/installers.html
-sed -i "s|UniqueURL|${wanip}|g" /opt/rustdesk-api-server/api/templates/installers.html
-sed -i "s|secure-string|${string64rev}|g" /opt/rustdesk-api-server/static/configs/install.ps1
-sed -i "s|secure-string|${string64rev}|g" /opt/rustdesk-api-server/static/configs/install.bat
-sed -i "s|secure-string|${string64rev}|g" /opt/rustdesk-api-server/static/configs/install-mac.sh
-sed -i "s|secure-string|${string64rev}|g" /opt/rustdesk-api-server/static/configs/install-linux.sh
+echo -e "${GREEN}Updating installer templates...${NC}"
+sed -i "s|secure-string|${string64rev}|g" /opt/rustdesk-api-server/api/templates/installers.html 2>/dev/null || true
+sed -i "s|UniqueKey|${key}|g" /opt/rustdesk-api-server/api/templates/installers.html 2>/dev/null || true
+sed -i "s|UniqueURL|${wanip}|g" /opt/rustdesk-api-server/api/templates/installers.html 2>/dev/null || true
+sed -i "s|secure-string|${string64rev}|g" /opt/rustdesk-api-server/static/configs/install.ps1 2>/dev/null || true
+sed -i "s|secure-string|${string64rev}|g" /opt/rustdesk-api-server/static/configs/install.bat 2>/dev/null || true
+sed -i "s|secure-string|${string64rev}|g" /opt/rustdesk-api-server/static/configs/install-mac.sh 2>/dev/null || true
+sed -i "s|secure-string|${string64rev}|g" /opt/rustdesk-api-server/static/configs/install-linux.sh 2>/dev/null || true
 
 # Generate QR code
-qrencode -o /opt/rustdesk-api-server/static/configs/qrcode.png config=${string64rev}
+if ! qrencode -o /opt/rustdesk-api-server/static/configs/qrcode.png "config=${string64rev}" 2>/dev/null; then
+    echo -e "${YELLOW}Warning: Failed to generate QR code${NC}"
+fi
 
 echo ""
 echo -e "${GREEN}========================================${NC}"
@@ -437,12 +602,26 @@ echo -e "3. Use the key displayed above in your client configuration"
 echo -e "4. All traffic is routed through Cloudflare Tunnel (no direct port exposure)"
 echo ""
 echo -e "${YELLOW}Service Status:${NC}"
-systemctl status rustdesk-hbbs --no-pager | grep "Active:"
-systemctl status rustdesk-hbbr --no-pager | grep "Active:"
-systemctl status rustdesk-api --no-pager | grep "Active:"
-systemctl status cloudflared --no-pager | grep "Active:"
+for service in rustdesk-hbbs rustdesk-hbbr rustdesk-api cloudflared; do
+    if systemctl is-active --quiet $service; then
+        echo -e "  ${service}: ${GREEN}✓ Running${NC}"
+    else
+        echo -e "  ${service}: ${RED}✗ Not Running${NC}"
+        echo -e "    ${YELLOW}Try: systemctl start ${service}${NC}"
+    fi
+done
 echo ""
-echo -e "${BLUE}Cloudflare Tunnel Logs:${NC} journalctl -u cloudflared -f"
-echo -e "${BLUE}RustDesk Logs:${NC} /var/log/rustdesk-server/"
-echo -e "${BLUE}API Logs:${NC} /var/log/rustdesk-server-api/"
+echo -e "${BLUE}Useful Commands:${NC}"
+echo -e "  View tunnel status: ${GREEN}cloudflared tunnel list${NC}"
+echo -e "  View tunnel logs: ${GREEN}journalctl -u cloudflared -f${NC}"
+echo -e "  View RustDesk logs: ${GREEN}tail -f /var/log/rustdesk-server/*.log${NC}"
+echo -e "  View API logs: ${GREEN}tail -f /var/log/rustdesk-server-api/*.log${NC}"
+echo -e "  Run diagnostics: ${GREEN}./diagnostics.sh${NC} (if available)"
+echo ""
+echo -e "${YELLOW}Next Steps:${NC}"
+echo -e "1. Access ${GREEN}https://${wanip}${NC} and log in"
+echo -e "2. Download pre-configured client installers from the web interface"
+echo -e "3. Deploy clients to your devices"
+echo ""
+echo -e "${GREEN}Installation completed successfully!${NC}"
 echo ""
